@@ -2,110 +2,89 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createServerClient } from '@supabase/ssr'
 import { cookies } from 'next/headers'
 
-type CookieInput = {
-  name: string
-  value: string
-  options?: {
-    path?: string
-    domain?: string
-    httpOnly?: boolean
-    secure?: boolean
-    maxAge?: number
-    expires?: Date
-    sameSite?: 'lax' | 'strict' | 'none'
-  }
-}
-
-export async function GET() {
-  const cookieStore = cookies()
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return cookieStore.getAll().map((c) => ({ name: c.name, value: c.value }))
-        },
-        setAll(cookies: CookieInput[]) {
-          cookies.forEach(({ name, value, options }) => cookieStore.set({ name, value, ...options }))
-        },
-      },
-    }
-  )
-  const { data, error } = await supabase
-    .from('articles')
-    .select('id,title,summary,cover_url,created_at,source')
-    .order('created_at', { ascending: false })
-    .limit(24)
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
-  }
-  return NextResponse.json({ data })
-}
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+const supabasePublishableKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY
 
 export async function POST(req: NextRequest) {
-  const cookieStore = cookies()
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY!,
-    {
+  try {
+    if (!supabaseUrl || !supabasePublishableKey) {
+      return NextResponse.json({
+        error: 'Supabase env missing',
+        detail: 'Ensure NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY are set.',
+      }, { status: 500 })
+    }
+    // Get user from server-side Supabase session via cookies
+    const cookieStore = cookies()
+    const supabaseServer = createServerClient(supabaseUrl ?? '', supabasePublishableKey ?? '', {
       cookies: {
         getAll() {
           return cookieStore.getAll().map((c) => ({ name: c.name, value: c.value }))
         },
-        setAll(cookies: CookieInput[]) {
+        setAll(cookies) {
           cookies.forEach(({ name, value, options }) => cookieStore.set({ name, value, ...options }))
         },
       },
+    })
+
+    const body = await req.json()
+    const { label, confidence, source, occurred_at } = body as {
+      label: string
+      confidence: number
+      source: 'upload' | 'camera'
+      occurred_at?: string
     }
-  )
+    if (!label || typeof confidence !== 'number' || !source) {
+      return NextResponse.json({ error: 'Invalid payload' }, { status: 400 })
+    }
 
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) {
-    return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
-  }
+    const { data: { user }, error: userErr } = await supabaseServer.auth.getUser()
+    if (userErr) {
+      console.error('Supabase getUser error:', userErr.message)
+    }
 
-  const { data: adminRow } = await supabase
-    .from('admin_users')
-    .select('id')
-    .eq('id', user.id)
-    .single()
-  if (!adminRow) {
-    return NextResponse.json({ error: 'Forbidden: admin only' }, { status: 403 })
-  }
+    const payload: Record<string, any> = {
+      label,
+      confidence,
+      source,
+      occurred_at: occurred_at ?? new Date().toISOString(),
+    }
+    if (!user?.id) {
+      return NextResponse.json({
+        error: 'Not authenticated',
+        hint: 'Login required before saving prediction. Ensure cookies/session present.'
+      }, { status: 401 })
+    }
 
-  const body = await req.json()
-  const { title, summary, content_url, cover_url, source } = body as {
-    title: string
-    summary: string
-    content_url?: string
-    cover_url?: string
-    source?: 'koran' | 'bacaan'
-  }
-  if (!title || !summary) {
-    return NextResponse.json({ error: 'Invalid payload' }, { status: 400 })
-  }
-
-  const sanitizeUrl = (url?: string) => {
-    const val = String(url || '').trim()
-    if (!val) return val
-    try {
-      const u = new URL(val)
-      if (u.hostname === 'www.google.com' && u.pathname === '/url' && u.searchParams.get('q')) {
-        return u.searchParams.get('q') as string
+    if (user?.id) {
+      payload.user_id = user.id
+      // Ensure user exists in public.app_users with default role 'user'
+        const { error: upsertErr } = await supabaseServer
+          .from('app_users')
+          .upsert({ id: user.id, email: user.email }, { onConflict: 'id' })
+      if (upsertErr) {
+        console.warn('Upsert app_users warning:', upsertErr.message)
       }
-      return val
-    } catch {
-      return val
     }
-  }
 
-  const { data, error } = await supabase
-    .from('articles')
-    .insert({ title, summary, content_url: sanitizeUrl(content_url), cover_url: sanitizeUrl(cover_url), source })
-    .select()
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    // Insert using server session client to respect RLS.
+    const { data, error } = await supabaseServer.from('predictions').insert(payload).select()
+    if (error) {
+      const msg = error.message || 'Unknown insert error'
+      const looksLikeHtml = typeof msg === 'string' && msg.includes('<html')
+      console.error('Predictions insert error:', msg)
+      return NextResponse.json({
+        error: looksLikeHtml ? 'Upstream error from Supabase (HTML response)' : msg,
+        hint: looksLikeHtml ? 'Check Supabase URL/key and network; Cloudflare 5xx may indicate misconfiguration or regional outage.' : undefined,
+      }, { status: 500 })
+    }
+    return NextResponse.json({ ok: true, data: Array.isArray(data) ? data[0] : data })
+  } catch (e: any) {
+    const msg = e?.message ?? String(e)
+    const looksLikeHtml = typeof msg === 'string' && msg.includes('<html')
+    console.error('Predictions route exception:', msg)
+    return NextResponse.json({
+      error: looksLikeHtml ? 'Upstream error from Supabase (HTML response)' : msg,
+      hint: looksLikeHtml ? 'Verify env NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY; ensure project reachable.' : undefined,
+    }, { status: 500 })
   }
-  return NextResponse.json({ ok: true, data: Array.isArray(data) ? data[0] : data })
 }
