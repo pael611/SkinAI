@@ -23,9 +23,12 @@ export async function POST() {
     process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY!,
     {
       cookies: {
-        get: (name: string) => cookieStore.get(name)?.value,
-        set: (name: string, value: string, options: any) => cookieStore.set({ name, value, ...options }),
-        remove: (name: string, options: any) => cookieStore.delete({ name, ...options }),
+        getAll() {
+          return cookieStore.getAll().map((c) => ({ name: c.name, value: c.value }))
+        },
+        setAll(cookies) {
+          cookies.forEach(({ name, value, options }) => cookieStore.set({ name, value, ...options }))
+        },
       },
     }
   )

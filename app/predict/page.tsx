@@ -1,6 +1,5 @@
 "use client"
 import { useEffect, useRef, useState } from "react"
-import * as ort from "onnxruntime-web"
 import NextImage from "next/image"
 // Helper: save prediction history via API
 async function savePrediction(payload: { label: string; confidence: number; source: "upload" | "camera"; occurred_at?: string }) {
@@ -52,7 +51,7 @@ export default function PredictPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const imageTensorRef = useRef<any>(null)
-  const ortRef = useRef<any>(ort)
+  const ortRef = useRef<any>(null)
   const sessionRef = useRef<any>(null)
   const camStreamRef = useRef<MediaStream | null>(null)
 
@@ -64,11 +63,39 @@ export default function PredictPage() {
       .catch(() => {})
   }, [])
 
+  // Load ORT from CDN to avoid bundler ESM issues
+  function loadOrtFromCdn() {
+    return new Promise<any>((resolve, reject) => {
+      if (typeof window === "undefined") return reject(new Error("Not in browser"))
+      const anyWin = window as any
+      if (anyWin.ort) return resolve(anyWin.ort)
+      const existing = document.getElementById("ort-cdn-script") as HTMLScriptElement | null
+      if (existing) {
+        existing.addEventListener("load", () => resolve((window as any).ort))
+        existing.addEventListener("error", () => reject(new Error("Failed to load ORT CDN script")))
+        return
+      }
+      const script = document.createElement("script")
+      script.id = "ort-cdn-script"
+      script.src = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"
+      script.async = true
+      script.crossOrigin = "anonymous"
+      script.onload = () => resolve((window as any).ort)
+      script.onerror = () => reject(new Error("Failed to load ORT CDN script"))
+      document.head.appendChild(script)
+    })
+  }
+
   // Initialize ORT session and warm cache
   useEffect(() => {
     if (sessionRef.current) return
     ;(async () => {
       try {
+        setLoadingMsg("Loading ONNX runtime…")
+        // Load ORT via CDN to force browser build
+        if (!ortRef.current) {
+          ortRef.current = await loadOrtFromCdn()
+        }
         setLoadingMsg("Loading ONNX model…")
         // Warm the browser cache
         try { await fetch(MODEL_URL, { cache: "force-cache" }) } catch {}

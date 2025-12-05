@@ -7,9 +7,9 @@ export const metadata: Metadata = {
   title: { default: 'SkinAI', template: '%s | SkinAI' },
   description: 'Next.js + Tailwind starter',
   icons: {
-    icon: [{ url: '/brandlogo.png', type: 'image/png' }],
-    shortcut: ['/brandlogo.png'],
-    apple: [{ url: '/brandlogo.png', type: 'image/png' }],
+    icon: [{ url: '/brandLogo.png', type: 'image/png' }],
+    shortcut: ['/brandLogo.png'],
+    apple: [{ url: '/brandLogo.png', type: 'image/png' }],
   },
 }
 

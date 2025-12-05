@@ -18,9 +18,12 @@ export async function GET() {
   const cookieStore = cookies()
   const supabase = createServerClient(supabaseUrl!, supabasePublishableKey!, {
     cookies: {
-      get(name: string) { return cookieStore.get(name)?.value },
-      set(name: string, value: string, options: any) { cookieStore.set({ name, value, ...options }) },
-      remove(name: string, options: any) { cookieStore.delete({ name, ...options }) },
+      getAll() {
+        return cookieStore.getAll().map((c) => ({ name: c.name, value: c.value }))
+      },
+      setAll(cookies) {
+        cookies.forEach(({ name, value, options }) => cookieStore.set({ name, value, ...options }))
+      },
     },
   })
 

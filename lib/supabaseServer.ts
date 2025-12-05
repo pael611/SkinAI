@@ -7,14 +7,11 @@ export function getSupabaseServerClient() {
   const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
   return createServerClient(supabaseUrl ?? '', supabaseAnonKey ?? '', {
     cookies: {
-      get(name: string) {
-        return cookieStore.get(name)?.value
+      getAll() {
+        return cookieStore.getAll().map((c) => ({ name: c.name, value: c.value }))
       },
-      set(name: string, value: string, options: any) {
-        cookieStore.set({ name, value, ...options })
-      },
-      remove(name: string, options: any) {
-        cookieStore.set({ name, value: '', ...options })
+      setAll(cookies) {
+        cookies.forEach(({ name, value, options }) => cookieStore.set({ name, value, ...options }))
       },
     },
   })
