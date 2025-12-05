@@ -1,54 +1,57 @@
 import { NextResponse } from 'next/server'
+import { cookies as nextCookies } from 'next/headers'
 import { createServerClient } from '@supabase/ssr'
-import { cookies } from 'next/headers'
+
+type CookieInput = {
+  name: string
+  value: string
+  options?: {
+    path?: string
+    domain?: string
+    httpOnly?: boolean
+    secure?: boolean
+    maxAge?: number
+    expires?: Date
+    sameSite?: 'lax' | 'strict' | 'none'
+  }
+}
 
 export async function GET() {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-  const supabasePublishableKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY
+  const cookieStore = nextCookies()
 
-  const envOk = Boolean(supabaseUrl && supabasePublishableKey)
-  if (!envOk) {
-    return NextResponse.json({
-      ok: false,
-      envOk,
-      error: 'Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY',
-    }, { status: 500 })
-  }
-
-  const cookieStore = cookies()
-  const supabase = createServerClient(supabaseUrl!, supabasePublishableKey!, {
-    cookies: {
-      getAll() {
-        return cookieStore.getAll().map((c) => ({ name: c.name, value: c.value }))
-      },
-      setAll(cookies) {
-        cookies.forEach(({ name, value, options }) => cookieStore.set({ name, value, ...options }))
-      },
+  const cookieAdapter = {
+    getAll() {
+      return cookieStore.getAll().map((c) => ({ name: c.name, value: c.value }))
     },
-  })
-
-  const { data: { user }, error: userErr } = await supabase.auth.getUser()
-
-  // Lightweight connectivity check: attempt a minimal query
-  let canQuery = false
-  let queryErrMsg: string | undefined
-  try {
-    const { error: qErr } = await supabase
-      .from('app_users')
-      .select('id')
-      .limit(1)
-    if (!qErr) canQuery = true
-    else queryErrMsg = qErr.message
-  } catch (e: any) {
-    queryErrMsg = e?.message ?? String(e)
+    setAll(cookies: CookieInput[]) {
+      cookies.forEach(({ name, value, options }) => {
+        cookieStore.set({ name, value, ...options })
+      })
+    },
+    get(name: string) {
+      const c = cookieStore.get(name)
+      return c ? c.value : undefined
+    },
+    set(name: string, value: string, options?: CookieInput['options']) {
+      cookieStore.set({ name, value, ...options })
+    },
+    remove(name: string, options?: CookieInput['options']) {
+      cookieStore.set({ name, value: '', ...(options ?? {}), maxAge: 0 })
+    },
   }
 
-  return NextResponse.json({
-    ok: envOk && !userErr,
-    envOk,
-    session: user ? { id: user.id, email: user.email } : null,
-    userError: userErr ? userErr.message : null,
-    canQuery,
-    queryError: queryErrMsg ?? null,
-  })
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY!,
+    { cookies: cookieAdapter }
+  )
+
+  // Health check sederhana: ping Supabase
+  const { error } = await supabase.from('health').select('id').limit(1)
+
+  if (error) {
+    return NextResponse.json({ status: 'unhealthy', error: error.message }, { status: 500 })
+  }
+
+  return NextResponse.json({ status: 'ok' }, { status: 200 })
 }
