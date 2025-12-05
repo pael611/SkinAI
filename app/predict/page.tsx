@@ -1,0 +1,380 @@
+"use client"
+import { useEffect, useRef, useState } from "react"
+import * as ort from "onnxruntime-web"
+import NextImage from "next/image"
+// Helper: save prediction history via API
+async function savePrediction(payload: { label: string; confidence: number; source: "upload" | "camera"; occurred_at?: string }) {
+  try {
+    const res = await fetch("/api/predictions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(text || "Failed to save prediction")
+    }
+    return await res.json()
+  } catch (e) {
+    console.error("Save prediction error:", e)
+    return null
+  }
+}
+
+type TreatmentRow = {
+  Id: string
+  Brand: string
+  "Product Name": string
+  Price: string
+  Links: string
+  Tags: string
+}
+
+const MODEL_URL = "/model/best_skin_model.onnx"
+const INPUT_SIZE = 224
+const categories = [
+  "Acne",
+  "Blackheads",
+  "Dark Spots",
+  "Normal Skin",
+  "Oily Skin",
+  "Wrinkles",
+]
+
+export default function PredictPage() {
+  const [sessionReady, setSessionReady] = useState(false)
+  const [loadingMsg, setLoadingMsg] = useState<string>("Loading ONNX model…")
+  const [treatments, setTreatments] = useState<TreatmentRow[]>([])
+  const [resultHtml, setResultHtml] = useState<string>("")
+  const [predictedTag, setPredictedTag] = useState<string | null>(null)
+
+  const imageRef = useRef<HTMLImageElement | null>(null)
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const imageTensorRef = useRef<any>(null)
+  const ortRef = useRef<any>(ort)
+  const sessionRef = useRef<any>(null)
+  const camStreamRef = useRef<MediaStream | null>(null)
+
+  // Load treatments
+  useEffect(() => {
+    fetch("/skincare_product/treatment.json")
+      .then((r) => r.json())
+      .then((data) => setTreatments(data))
+      .catch(() => {})
+  }, [])
+
+  // Initialize ORT session and warm cache
+  useEffect(() => {
+    if (sessionRef.current) return
+    ;(async () => {
+      try {
+        setLoadingMsg("Loading ONNX model…")
+        // Warm the browser cache
+        try { await fetch(MODEL_URL, { cache: "force-cache" }) } catch {}
+        // Create session
+        sessionRef.current = await ortRef.current.InferenceSession.create(MODEL_URL)
+        // Optional: warm up kernels with a dummy input
+        const dummy = new ortRef.current.Tensor("float32", new Float32Array(INPUT_SIZE * INPUT_SIZE * 3), [1, INPUT_SIZE, INPUT_SIZE, 3])
+        const inputName = sessionRef.current.inputNames?.[0] ?? Object.keys(sessionRef.current.inputMetadata)[0]
+        try { await sessionRef.current.run({ [inputName]: dummy }) } catch {}
+        setSessionReady(true)
+        setLoadingMsg("Model loaded. Upload an image or use camera.")
+      } catch (e: any) {
+        setLoadingMsg(`Failed to load model: ${e?.message ?? e}`)
+      }
+    })()
+  }, [])
+
+  function setResult(html: string) {
+    setResultHtml(html)
+  }
+
+  async function onFileChange(ev: React.ChangeEvent<HTMLInputElement>) {
+    const file = ev.target.files?.[0]
+    if (!file || !imageRef.current) return
+    const reader = new FileReader()
+    reader.onload = () => {
+      imageRef.current!.src = reader.result as string
+      imageRef.current!.style.display = "block"
+    }
+    reader.readAsDataURL(file)
+  }
+
+  function preprocessImage(img: HTMLImageElement, size = INPUT_SIZE) {
+    const canvas = document.createElement("canvas")
+    canvas.width = size
+    canvas.height = size
+    const ctx = canvas.getContext("2d")!
+
+    // Center-crop preserve aspect ratio
+    const sw = img.naturalWidth || img.width
+    const sh = img.naturalHeight || img.height
+    const arSrc = sw / sh
+    const arDst = 1
+    let sx = 0,
+      sy = 0,
+      sWidth = sw,
+      sHeight = sh
+    if (arSrc > arDst) {
+      sWidth = sh * arDst
+      sx = (sw - sWidth) / 2
+    } else {
+      sHeight = sw / arDst
+      sy = (sh - sHeight) / 2
+    }
+    ctx.drawImage(img, sx, sy, sWidth, sHeight, 0, 0, size, size)
+
+    const imageData = ctx.getImageData(0, 0, size, size)
+    const { data } = imageData
+    const arr = new Float32Array(size * size * 3)
+    // Normalize to [-1, 1] (MobileNetV2-style) or adjust per your model
+    for (let i = 0; i < size * size; i++) {
+      arr[i * 3 + 0] = data[i * 4 + 0] / 127.5 - 1
+      arr[i * 3 + 1] = data[i * 4 + 1] / 127.5 - 1
+      arr[i * 3 + 2] = data[i * 4 + 2] / 127.5 - 1
+    }
+    // Return NHWC tensor [1, size, size, 3]
+    return new ortRef.current.Tensor("float32", arr, [1, size, size, 3])
+  }
+
+  async function runPredict() {
+    if (!sessionRef.current) {
+      setResult("Model not loaded")
+      return
+    }
+    const imgEl = imageRef.current
+    if (!imgEl || !imgEl.src || imgEl.src === "#") {
+      setResult("Please upload an image first.")
+      return
+    }
+    const img = new window.Image()
+    img.crossOrigin = "anonymous"
+    img.onload = async () => {
+      imageTensorRef.current = preprocessImage(img)
+      try {
+        const feeds: Record<string, any> = {}
+        const inputName = sessionRef.current.inputNames?.[0] ?? Object.keys(sessionRef.current.inputMetadata)[0]
+        feeds[inputName] = imageTensorRef.current
+        setResult("Running inference…")
+        const output = await sessionRef.current.run(feeds)
+        const outName = sessionRef.current.outputNames?.[0] ?? Object.keys(output)[0]
+        const scores: Float32Array = output[outName].data
+        let bestIdx = 0
+        for (let i = 1; i < scores.length; i++) if (scores[i] > scores[bestIdx]) bestIdx = i
+        const bestScore = scores[bestIdx]
+        const label = categories[bestIdx] ?? `class_${bestIdx}`
+
+        const html = `<div class=\"rounded border border-emerald-200 bg-emerald-50 p-3 text-emerald-800\"><b>Prediksi:</b> ${label}<br/><b>Confidence:</b> ${(bestScore * 100).toFixed(2)}%</div>`
+        setPredictedTag(label)
+        setResult(html)
+
+        // Save to history (anonymous or with user if signed-in)
+        await savePrediction({ label, confidence: Number((bestScore).toFixed(6)), source: camStreamRef.current ? "camera" : "upload", occurred_at: new Date().toISOString() })
+      } catch (e: any) {
+        setResult(`Inference failed: ${e?.message ?? e}`)
+      }
+    }
+    img.src = imgEl.src
+  }
+
+  function Recommendations({ tag }: { tag: string }) {
+    const produk = treatments.filter((row) => row.Tags?.toLowerCase() === tag.toLowerCase())
+    if (produk.length === 0) {
+      return <div className="mt-4 rounded border border-amber-200 bg-amber-50 p-3 text-amber-800 dark:border-amber-400/30 dark:bg-neutral-900 dark:text-amber-300">Tidak ada rekomendasi produk untuk kategori ini.</div>
+    }
+    return (
+      <div className="mt-8">
+        <h4 className="mb-4 text-xl font-extrabold tracking-tight text-emerald-900">Rekomendasi Produk</h4>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          {produk.map((row) => {
+            const imgPath = findProductImage(row.Id)
+            return (
+              <div
+                key={row.Id}
+                className="group flex items-center gap-4 rounded-2xl border border-emerald-100 bg-white p-4 shadow-sm transition hover:shadow-md dark:border-emerald-800/40 dark:bg-emerald-900/20"
+              >
+                <NextImage
+                  src={imgPath}
+                  alt="produk"
+                  width={96}
+                  height={96}
+                  className="h-24 w-24 rounded-xl object-cover ring-1 ring-emerald-100 group-hover:ring-emerald-200 dark:ring-emerald-700/50"
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm text-neutral-500">{row.Brand}</div>
+                  <div className="truncate text-lg font-semibold text-neutral-900">{row["Product Name"]}</div>
+                  <div className="mt-1 inline-flex items-center gap-2 text-xs">
+                    <span className="rounded-full bg-emerald-50 px-2 py-0.5 font-medium text-emerald-700">{row.Price}</span>
+                    <span className="rounded-full bg-neutral-100 px-2 py-0.5 text-neutral-700">{tag}</span>
+                  </div>
+                  <div className="mt-3">
+                    <a
+                      href={row.Links}
+                      target="_blank"
+                      className="inline-flex items-center gap-2 rounded-lg border border-emerald-200 px-3 py-1.5 text-sm font-medium text-emerald-800 transition hover:bg-emerald-50"
+                    >
+                      Lihat Produk
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" className="text-emerald-700">
+                        <path d="M7 17L17 7M17 7H9M17 7V15" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    </a>
+                  </div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
+
+  function findProductImage(id: string) {
+    const exts = ["png", "jpg", "webp"]
+    for (const ext of exts) {
+      const path = `/skincare_product/gambar_produk/${id}.${ext}`
+      // We optimistically return the first candidate; onerror hides if missing
+      return path
+    }
+    return "/skincare_product/gambar_produk/default.png"
+  }
+
+  async function startCamera() {
+    if (!videoRef.current) return
+    // Feature detection and secure context requirement
+    if (typeof navigator === "undefined" || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setResult('<div class="alert alert-danger">Browser tidak mendukung camera API.</div>')
+      return
+    }
+    if (window.isSecureContext === false) {
+      setResult('<div class="alert alert-warning">Kamera memerlukan konteks aman (HTTPS atau http://localhost). Pastikan aplikasi berjalan di http://localhost atau gunakan HTTPS.</div>')
+    }
+    try {
+      const constraints: MediaStreamConstraints = {
+        video: {
+          facingMode: { ideal: "user" },
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+        },
+        audio: false,
+      }
+      camStreamRef.current = await navigator.mediaDevices.getUserMedia(constraints)
+      videoRef.current.srcObject = camStreamRef.current
+      videoRef.current.setAttribute("playsinline", "true")
+      videoRef.current.style.display = "block"
+      await videoRef.current.play().catch(() => {})
+      setResult("")
+    } catch (e: any) {
+      const name = e?.name || "Error"
+      const msg = e?.message || String(e)
+      let hint = ""
+      if (name === "NotAllowedError") {
+        hint = "Izin kamera ditolak. Buka pengaturan site pada browser dan izinkan kamera."
+      } else if (name === "NotFoundError") {
+        hint = "Perangkat kamera tidak ditemukan. Pastikan kamera terhubung dan tidak dipakai aplikasi lain."
+      } else if (name === "NotReadableError") {
+        hint = "Kamera sedang dipakai aplikasi lain. Tutup aplikasi kamera lain dan coba lagi."
+      }
+      setResult(`<div class="alert alert-danger">Tidak bisa mengakses kamera: ${msg}${hint ? "<br>" + hint : ""}</div>`)
+    }
+  }
+
+  function stopCamera() {
+    if (camStreamRef.current) {
+      camStreamRef.current.getTracks().forEach((t) => t.stop())
+      camStreamRef.current = null
+    }
+    if (videoRef.current) {
+      ;(videoRef.current as any).srcObject = null
+      videoRef.current.style.display = "none"
+    }
+  }
+
+  function captureFrame() {
+    if (!videoRef.current || !canvasRef.current || !imageRef.current) return
+    const vw = videoRef.current.videoWidth
+    const vh = videoRef.current.videoHeight
+    const ar = vw / vh
+    let sx = 0,
+      sy = 0,
+      sw = vw,
+      sh = vh
+    if (ar > 1) {
+      sw = vh
+      sx = (vw - sw) / 2
+    } else {
+      sh = vw
+      sy = (vh - sh) / 2
+    }
+    const ctx = canvasRef.current.getContext("2d")!
+    ctx.clearRect(0, 0, INPUT_SIZE, INPUT_SIZE)
+    ctx.drawImage(videoRef.current, sx, sy, sw, sh, 0, 0, INPUT_SIZE, INPUT_SIZE)
+    const dataUrl = canvasRef.current.toDataURL("image/png")
+    imageRef.current.src = dataUrl
+    imageRef.current.style.display = "block"
+  }
+
+  return (
+    <main className="mx-auto max-w-2xl px-4 py-8 sm:px-6">
+      <h2 className="mb-6 text-center text-2xl font-bold">Prediksi Penyakit Kulit Wajah (ONNX)</h2>
+      <div className="space-y-4">
+        <input type="file" accept="image/*" className="w-full rounded border border-neutral-300 px-3 py-2 focus:border-emerald-600 focus:outline-none" onChange={onFileChange} />
+        <div className="flex flex-wrap items-center justify-center gap-3">
+          <button className="w-full rounded border border-neutral-300 px-4 py-2 text-neutral-700 hover:bg-neutral-100 sm:w-auto" onClick={startCamera}>Buka Kamera</button>
+          <button className="w-full rounded border border-emerald-600 px-4 py-2 text-emerald-700 hover:bg-emerald-50 sm:w-auto" onClick={captureFrame}>Ambil Foto</button>
+          <button className="w-full rounded border border-red-600 px-4 py-2 text-red-700 hover:bg-red-50 sm:w-auto" onClick={stopCamera}>Matikan Kamera</button>
+        </div>
+        <div className="flex justify-center">
+          <video ref={videoRef} autoPlay playsInline className="hidden max-w-[224px] rounded" />
+        </div>
+        <canvas ref={canvasRef} width={INPUT_SIZE} height={INPUT_SIZE} className="hidden" />
+        <div className="flex justify-center">
+          <img ref={imageRef} id="preview" src="#" alt="Preview" className="hidden max-w-[224px] rounded border border-neutral-200" />
+        </div>
+        <div className="flex justify-center">
+          <button className="w-full rounded bg-emerald-600 px-5 py-2.5 text-white hover:bg-emerald-700 disabled:opacity-50 sm:w-auto" onClick={runPredict} disabled={!sessionReady}>Prediksi</button>
+        </div>
+        {sessionReady ? (
+          resultHtml ? (
+            <div className="result text-neutral-700" dangerouslySetInnerHTML={{ __html: resultHtml }} />
+          ) : (
+            <div className="mx-auto max-w-md">
+              <div className="rounded-lg border border-emerald-200 bg-white p-4 text-sm text-neutral-800 shadow-sm">
+                <div className="flex items-center gap-2">
+                  <svg className="h-5 w-5 text-emerald-600" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path d="M12 2a10 10 0 100 20 10 10 0 000-20z" stroke="currentColor" strokeWidth="1.5" />
+                    <path d="M8 12l2.5 2.5L16 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <span className="font-medium">Model berhasil dimuat</span>
+                </div>
+                <p className="mt-2 text-neutral-700">Unggah gambar atau gunakan kamera, lalu tekan <span className="font-semibold">Prediksi</span> untuk mulai.</p>
+                <div className="mt-3 flex items-center gap-2">
+                  <span className="inline-block h-2 w-2 animate-bounce rounded-full bg-emerald-500" />
+                  <span className="inline-block h-2 w-2 animate-bounce rounded-full bg-emerald-500 [animation-delay:150ms]" />
+                  <span className="inline-block h-2 w-2 animate-bounce rounded-full bg-emerald-500 [animation-delay:300ms]" />
+                </div>
+              </div>
+            </div>
+          )
+        ) : (
+          <div className="mx-auto max-w-md">
+            <div className="animate-pulse rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800 shadow-sm">
+              <div className="flex items-center gap-2">
+                <svg className="h-5 w-5 text-emerald-600" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="1.5" />
+                  <path d="M12 6v6l4 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+                <span className="font-medium">Memuat model ONNX…</span>
+              </div>
+              <p className="mt-2 text-emerald-700">Menyiapkan sesi inferensi agar prediksi lebih cepat saat Anda mulai.</p>
+              <div className="mt-3 h-2 w-full rounded bg-emerald-100">
+                <div className="h-2 w-1/2 rounded bg-emerald-400"></div>
+              </div>
+            </div>
+          </div>
+        )}
+        {predictedTag ? <Recommendations tag={predictedTag} /> : null}
+      </div>
+    </main>
+  )
+}
