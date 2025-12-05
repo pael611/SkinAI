@@ -16,12 +16,10 @@ type CookieInput = {
   }
 }
 
-export async function GET() {
+export async function POST(req: Request) {
   const cookieStore = nextCookies()
 
-  // Adapter cookies untuk Supabase SSR
   const cookieAdapter = {
-    // API baru ssr menerima getAll/setAll
     getAll() {
       return cookieStore.getAll().map((c) => ({ name: c.name, value: c.value }))
     },
@@ -30,7 +28,6 @@ export async function GET() {
         cookieStore.set({ name, value, ...options })
       })
     },
-    // Tambahkan fallback API lama (get/set/remove) jika diperlukan oleh versi paket
     get(name: string) {
       const c = cookieStore.get(name)
       return c ? c.value : undefined
@@ -39,7 +36,6 @@ export async function GET() {
       cookieStore.set({ name, value, ...options })
     },
     remove(name: string, options?: CookieInput['options']) {
-      // remove dengan set empty + maxAge 0
       cookieStore.set({ name, value: '', ...(options ?? {}), maxAge: 0 })
     },
   }
@@ -47,19 +43,26 @@ export async function GET() {
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY!,
-    {
-      cookies: cookieAdapter,
-    }
+    { cookies: cookieAdapter }
   )
 
-  const { data, error } = await supabase
-    .from('articles')
-    .select('*')
-    .limit(20)
+  // Contoh: sanitasi payload dan simpan (sesuaikan kebutuhan)
+  const body = await req.json().catch(() => null)
+  if (!body || typeof body !== 'object') {
+    return NextResponse.json({ error: 'Invalid payload' }, { status: 400 })
+  }
+
+  // Misal ambil fields tertentu
+  const sanitized = {
+    title: String(body.title ?? '').trim(),
+    content: String(body.content ?? '').trim(),
+  }
+
+  const { data, error } = await supabase.from('articles').insert(sanitized).select('*').single()
 
   if (error) {
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
-  return NextResponse.json({ articles: data ?? [] }, { status: 200 })
+  return NextResponse.json({ article: data }, { status: 201 })
 }
