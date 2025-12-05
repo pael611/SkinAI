@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { cookies as nextCookies } from 'next/headers'
-import { createClient } from '@supabase/ssr'
+import { createServerClient } from '@supabase/ssr'
 
 type CookieInput = {
   name: string
@@ -19,21 +19,32 @@ type CookieInput = {
 export async function GET() {
   const cookieStore = nextCookies()
 
-  // Adapter cookie untuk Supabase SSR dengan tipe yang eksplisit
+  // Adapter cookies untuk Supabase SSR
   const cookieAdapter = {
+    // API baru ssr menerima getAll/setAll
     getAll() {
       return cookieStore.getAll().map((c) => ({ name: c.name, value: c.value }))
     },
     setAll(cookies: CookieInput[]) {
       cookies.forEach(({ name, value, options }) => {
-        // next/headers cookies().set(name, value, options?)
-        // options pada Supabase sudah kompatibel dengan cookies().set
         cookieStore.set({ name, value, ...options })
       })
     },
+    // Tambahkan fallback API lama (get/set/remove) jika diperlukan oleh versi paket
+    get(name: string) {
+      const c = cookieStore.get(name)
+      return c ? c.value : undefined
+    },
+    set(name: string, value: string, options?: CookieInput['options']) {
+      cookieStore.set({ name, value, ...options })
+    },
+    remove(name: string, options?: CookieInput['options']) {
+      // remove dengan set empty + maxAge 0
+      cookieStore.set({ name, value: '', ...(options ?? {}), maxAge: 0 })
+    },
   }
 
-  const supabase = createClient(
+  const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY!,
     {
@@ -41,7 +52,6 @@ export async function GET() {
     }
   )
 
-  // Contoh query sederhana, sesuaikan nama tabel/kolom Anda
   const { data, error } = await supabase
     .from('articles')
     .select('*')
