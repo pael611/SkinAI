@@ -1,90 +1,66 @@
-import { NextRequest, NextResponse } from 'next/server'
+import { NextResponse } from 'next/server'
+import { cookies as nextCookies } from 'next/headers'
 import { createServerClient } from '@supabase/ssr'
-import { cookies } from 'next/headers'
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
-const supabasePublishableKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY
+type CookieInput = {
+  name: string
+  value: string
+  options?: {
+    path?: string
+    domain?: string
+    httpOnly?: boolean
+    secure?: boolean
+    maxAge?: number
+    expires?: Date
+    sameSite?: 'lax' | 'strict' | 'none'
+  }
+}
 
-export async function POST(req: NextRequest) {
-  try {
-    if (!supabaseUrl || !supabasePublishableKey) {
-      return NextResponse.json({
-        error: 'Supabase env missing',
-        detail: 'Ensure NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY are set.',
-      }, { status: 500 })
-    }
-    // Get user from server-side Supabase session via cookies
-    const cookieStore = cookies()
-    const supabaseServer = createServerClient(supabaseUrl ?? '', supabasePublishableKey ?? '', {
+export async function POST(req: Request) {
+  const cookieStore = nextCookies()
+
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY!,
+    {
       cookies: {
         getAll() {
           return cookieStore.getAll().map((c) => ({ name: c.name, value: c.value }))
         },
-        setAll(cookies) {
-          cookies.forEach(({ name, value, options }) => cookieStore.set({ name, value, ...options }))
+        setAll(cookies: CookieInput[]) {
+          cookies.forEach(({ name, value, options }) => {
+            cookieStore.set({ name, value, ...options })
+          })
+        },
+        // opsional: kompatibilitas API lama
+        get(name: string) {
+          const c = cookieStore.get(name)
+          return c ? c.value : undefined
+        },
+        set(name: string, value: string, options?: CookieInput['options']) {
+          cookieStore.set({ name, value, ...options })
+        },
+        remove(name: string, options?: CookieInput['options']) {
+          cookieStore.set({ name, value: '', ...(options ?? {}), maxAge: 0 })
         },
       },
-    })
+    }
+  )
 
-    const body = await req.json()
-    const { label, confidence, source, occurred_at } = body as {
-      label: string
-      confidence: number
-      source: 'upload' | 'camera'
-      occurred_at?: string
-    }
-    if (!label || typeof confidence !== 'number' || !source) {
-      return NextResponse.json({ error: 'Invalid payload' }, { status: 400 })
-    }
-
-    const { data: { user }, error: userErr } = await supabaseServer.auth.getUser()
-    if (userErr) {
-      console.error('Supabase getUser error:', userErr.message)
-    }
-
-    const payload: Record<string, any> = {
-      label,
-      confidence,
-      source,
-      occurred_at: occurred_at ?? new Date().toISOString(),
-    }
-    if (!user?.id) {
-      return NextResponse.json({
-        error: 'Not authenticated',
-        hint: 'Login required before saving prediction. Ensure cookies/session present.'
-      }, { status: 401 })
-    }
-
-    if (user?.id) {
-      payload.user_id = user.id
-      // Ensure user exists in public.app_users with default role 'user'
-        const { error: upsertErr } = await supabaseServer
-          .from('app_users')
-          .upsert({ id: user.id, email: user.email }, { onConflict: 'id' })
-      if (upsertErr) {
-        console.warn('Upsert app_users warning:', upsertErr.message)
-      }
-    }
-
-    // Insert using server session client to respect RLS.
-    const { data, error } = await supabaseServer.from('predictions').insert(payload).select()
-    if (error) {
-      const msg = error.message || 'Unknown insert error'
-      const looksLikeHtml = typeof msg === 'string' && msg.includes('<html')
-      console.error('Predictions insert error:', msg)
-      return NextResponse.json({
-        error: looksLikeHtml ? 'Upstream error from Supabase (HTML response)' : msg,
-        hint: looksLikeHtml ? 'Check Supabase URL/key and network; Cloudflare 5xx may indicate misconfiguration or regional outage.' : undefined,
-      }, { status: 500 })
-    }
-    return NextResponse.json({ ok: true, data: Array.isArray(data) ? data[0] : data })
-  } catch (e: any) {
-    const msg = e?.message ?? String(e)
-    const looksLikeHtml = typeof msg === 'string' && msg.includes('<html')
-    console.error('Predictions route exception:', msg)
-    return NextResponse.json({
-      error: looksLikeHtml ? 'Upstream error from Supabase (HTML response)' : msg,
-      hint: looksLikeHtml ? 'Verify env NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY; ensure project reachable.' : undefined,
-    }, { status: 500 })
+  const body = await req.json().catch(() => null)
+  if (!body || typeof body !== 'object') {
+    return NextResponse.json({ error: 'Invalid payload' }, { status: 400 })
   }
+
+  const { data, error } = await supabase
+    .from('predictions')
+    .insert(body)
+    .select('*')
+    .single()
+
+  if (error) {
+    return NextResponse.json({ error: error.message }, { status: 500 })
+  }
+
+  return NextResponse.json({ prediction: data }, { status: 201 })
 }
